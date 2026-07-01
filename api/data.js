@@ -1,0 +1,108 @@
+// Vercel serverless function: GET /api/data
+// Fetches live World Cup 2026 data from KickoffAPI (key from env) and returns the
+// dashboard's WC_DATA shape. The API key stays server-side; the browser only sees JSON.
+//
+// Required env var (set in Vercel → Project → Settings → Environment Variables):
+//   KICKOFF_API_KEY   your KickoffAPI key
+// Optional:
+//   KICKOFF_LEAGUE_ID (defaults to auto-detecting the World Cup finals)
+//   KICKOFF_SEASON    (defaults to 2026)
+
+const BASE = "https://api.kickoffapi.com/api/v1";
+
+const OWNERS = {
+  "Mexico":"Alecia Bland","South Africa":"Jessie Edwards","Switzerland":"Rudolf Arada","Canada":"Ayush Nigam",
+  "Bosnia and Herzegovina":"Rudolf Arada","Brazil":"Simon Clark","Morocco":"Dan Skipper","USA":"Sally Rooney",
+  "Australia":"Ayush Nigam","Paraguay":"Alecia Bland","Germany":"Lucia Noriega","Ivory Coast":"Jordan Dashfield",
+  "Ecuador":"Dan Skipper","Netherlands":"Kerry Hiki","Japan":"Lucia Noriega","Sweden":"Rami Elbeltagi",
+  "Belgium":"Clinton McClean","Egypt":"Clinton McClean","Spain":"Thomas Mitchell","Cape Verde":"Simon Molenaar",
+  "France":"Adam McElroy","Norway":"Rami Elbeltagi","Senegal":"Marc Tinsel","Argentina":"Declan Burke",
+  "Austria":"Declan Burke","Algeria":"Adam McElroy","Colombia":"Simon Molenaar","Portugal":"Jordan Dashfield",
+  "Democratic Republic of the Congo":"Kerry Hiki","England":"Marc Tinsel","Croatia":"Sally Rooney","Ghana":"Thomas Mitchell"
+};
+const ALIASES = {
+  "united states":"USA","usa":"USA","united states of america":"USA",
+  "cote d'ivoire":"Ivory Coast","côte d'ivoire":"Ivory Coast","ivory coast":"Ivory Coast",
+  "congo dr":"Democratic Republic of the Congo","dr congo":"Democratic Republic of the Congo",
+  "democratic republic of congo":"Democratic Republic of the Congo","democratic republic of the congo":"Democratic Republic of the Congo",
+  "cape verde islands":"Cape Verde","cabo verde":"Cape Verde","cape verde":"Cape Verde",
+  "bosnia":"Bosnia and Herzegovina","bosnia & herzegovina":"Bosnia and Herzegovina","bosnia and herzegovina":"Bosnia and Herzegovina"
+};
+const CANON = new Set(Object.keys(OWNERS));
+const strip = s => (s||"").normalize("NFD").replace(/[̀-ͯ]/g,"").replace(/&/g," and ").replace(/\s+/g," ").toLowerCase().trim();
+function normalizeName(n){ if(!n) return null; const k=strip(n); if(ALIASES[k]) return ALIASES[k];
+  for(const c of CANON){ if(strip(c)===k) return c; } return n; }
+function mapStatus(s){ s=(s||"").toUpperCase();
+  if(["NS","TBD","PST"].includes(s)) return "up";
+  if(["1H","2H","ET","BT","LIVE","INT"].includes(s)) return "live";
+  if(s==="HT") return "ht"; if(s==="P"||s==="PEN") return "pens"; if(s==="AET") return "aet";
+  if(["FT","AWD","WO"].includes(s)) return "ft"; return "up"; }
+function stageByDate(iso){ const t=new Date(iso).getTime(); const D=(y,m,d)=>Date.UTC(y,m-1,d);
+  if(isNaN(t)||t<D(2026,6,28)) return "group";
+  if(t<D(2026,7,4)) return "r32"; if(t<D(2026,7,8)) return "r16";
+  if(t<D(2026,7,12)) return "qf"; if(t<D(2026,7,16)) return "sf"; return "final"; }
+const pick=(...v)=>v.find(x=>x!==undefined&&x!==null);
+
+async function api(key, endpoint, params={}){
+  const url=new URL(BASE+endpoint);
+  Object.entries(params).forEach(([k,v])=> v!=null && url.searchParams.set(k,v));
+  const r=await fetch(url,{headers:{"x-api-key":key,"accept":"application/json"}});
+  if(!r.ok) throw new Error(`${r.status} on ${endpoint}`);
+  const j=await r.json(); return j.response ?? j;
+}
+async function resolveLeagueId(key){
+  if(process.env.KICKOFF_LEAGUE_ID) return process.env.KICKOFF_LEAGUE_ID;
+  const leagues=await api(key,"/leagues",{search:"World Cup",type:"Cup"});
+  const named=(leagues||[]).map(l=>({id:l.id||l.league?.id,name:(l.name||l.league?.name||"").trim()}));
+  const finals=n=>/world cup/i.test(n)&&!/qualif|women|u-?\d\d?|futsal|beach|club/i.test(n);
+  const c=named.filter(l=>l.id&&finals(l.name));
+  const pickL=c.find(l=>/^world cup$/i.test(l.name))||c.sort((a,b)=>a.name.length-b.name.length)[0];
+  if(!pickL) throw new Error("Could not resolve World Cup league id; set KICKOFF_LEAGUE_ID.");
+  return pickL.id;
+}
+function transform(fixtures, standings, season){
+  const owned=c=>OWNERS[c]||null;
+  const matches=(fixtures||[]).map(f=>{
+    const home=normalizeName(pick(f?.teams?.home?.name,f?.homeTeam?.name,f?.home?.name));
+    const away=normalizeName(pick(f?.teams?.away?.name,f?.awayTeam?.name,f?.away?.name));
+    const date=pick(f?.fixture?.date,f?.date);
+    let status=mapStatus(pick(f?.fixture?.status?.short,f?.statusShort,f?.status?.short));
+    const hg=pick(f?.goals?.home,f?.goalsHome,f?.homeTeam?.goals,f?.scoreFullHome,null);
+    const ag=pick(f?.goals?.away,f?.goalsAway,f?.awayTeam?.goals,f?.scoreFullAway,null);
+    const penH=pick(f?.score?.penalty?.home,f?.scorePenaltyHome,null);
+    const penA=pick(f?.score?.penalty?.away,f?.scorePenaltyAway,null);
+    if(penH!=null&&penA!=null&&(status==="ft"||status==="aet")) status="pens";
+    const m={ id:"k"+(pick(f?.fixture?.id,f?.id)??Math.random().toString(36).slice(2)),
+      stage:stageByDate(date), date, status, minute:pick(f?.fixture?.status?.elapsed,f?.elapsed,null),
+      home, away, ownerHome:owned(home), ownerAway:owned(away),
+      hg:(hg==null?null:Number(hg)), ag:(ag==null?null:Number(ag)) };
+    if(penH!=null&&penA!=null) m.pens={home:Number(penH),away:Number(penA)};
+    return m;
+  }).filter(m=>m.home&&m.away);
+  // group tables (best-effort across response shapes)
+  let groups=[];
+  if(Array.isArray(standings)&&standings[0]?.league?.standings){
+    groups=standings[0].league.standings.map((rows,i)=>({ name: rows[0]?.group?.replace(/^Group\s*/i,"")||String.fromCharCode(65+i),
+      teams: rows.map(r=>{ const all=r.all||{},g=all.goals||{}; const country=normalizeName(r.team?.name||r.name);
+        return {country, owner:owned(country), rank:r.rank??null, played:all.played??0, win:all.win??0, draw:all.draw??0, lose:all.lose??0,
+          gf:(g.for??0), ga:(g.against??0), gd:r.goalsDiff??((g.for??0)-(g.against??0)), points:r.points??0}; }) }));
+  }
+  return { updatedAt:new Date().toISOString(), source:"KickoffAPI", season, groups, matches };
+}
+
+export default async function handler(req, res){
+  try{
+    const key=process.env.KICKOFF_API_KEY;
+    if(!key){ res.status(500).json({error:"KICKOFF_API_KEY not set"}); return; }
+    const season=Number(process.env.KICKOFF_SEASON||2026);
+    const leagueId=await resolveLeagueId(key);
+    const [fixtures, standings]=await Promise.all([
+      api(key,"/fixtures",{league:leagueId,season}),
+      api(key,"/standings",{league:leagueId,season}).catch(()=>[])
+    ]);
+    const data=transform(fixtures, standings, season);
+    // cache at the edge so we don't hammer KickoffAPI when many people open the page
+    res.setHeader("Cache-Control","s-maxage=60, stale-while-revalidate=120");
+    res.status(200).json(data);
+  }catch(e){ res.status(502).json({error:String(e.message||e)}); }
+}

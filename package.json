@@ -1,0 +1,8 @@
+{
+  "name": "wc26-sweepstakes-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AoFrio World Cup 2026 office sweepstakes bracket dashboard",
+  "type": "module",
+  "engines": { "node": ">=18" }
+}
