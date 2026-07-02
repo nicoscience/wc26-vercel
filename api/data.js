@@ -47,8 +47,34 @@ async function api(key, endpoint, params={}){
   const url=new URL(BASE+endpoint);
   Object.entries(params).forEach(([k,v])=> v!=null && url.searchParams.set(k,v));
   const r=await fetch(url,{headers:{"x-api-key":key,"accept":"application/json"}});
-  if(!r.ok) throw new Error(`${r.status} on ${endpoint}`);
+  if(!r.ok){ const e=new Error(`${r.status} on ${endpoint}`); e.status=r.status; throw e; }
   const j=await r.json(); return j.response ?? j;
+}
+
+// World Cup 2026 runs 2026-06-11 → 2026-07-19. The free ("Hobby") KickoffAPI plan
+// gates live=all and, in practice, the bulk league+season fixtures query (403 =
+// "Endpoint not on your plan"). So try the cheap query first, then fall back to
+// date-scoped queries that the free tier does allow.
+const WC_FROM="2026-06-11", WC_TO="2026-07-19";
+function eachDate(fromISO, toISO){
+  const out=[]; const d=new Date(fromISO+"T00:00:00Z"); const end=new Date(toISO+"T00:00:00Z");
+  for(; d<=end; d.setUTCDate(d.getUTCDate()+1)) out.push(d.toISOString().slice(0,10));
+  return out;
+}
+async function fetchFixtures(key, leagueId, season){
+  // 1) whole-season pull (works on paid plans; may 403 on free)
+  try{ const f=await api(key,"/fixtures",{league:leagueId,season}); if(Array.isArray(f)&&f.length) return f; }
+  catch(e){ if(e.status&&e.status!==403) throw e; }
+  // 2) single date-range pull over the tournament window
+  try{ const f=await api(key,"/fixtures",{league:leagueId,season,from:WC_FROM,to:WC_TO});
+    if(Array.isArray(f)&&f.length) return f; }
+  catch(e){ if(e.status&&e.status!==403) throw e; }
+  // 3) last resort: one request per date (free-tier safe; bounded by the 39-day window)
+  const days=eachDate(WC_FROM,WC_TO);
+  const perDay=await Promise.all(days.map(date=>
+    api(key,"/fixtures",{league:leagueId,season,date}).catch(()=>[])
+  ));
+  return perDay.flat().filter(Boolean);
 }
 async function resolveLeagueId(key){
   if(process.env.KICKOFF_LEAGUE_ID) return process.env.KICKOFF_LEAGUE_ID;
@@ -97,7 +123,7 @@ export default async function handler(req, res){
     const season=Number(process.env.KICKOFF_SEASON||2026);
     const leagueId=await resolveLeagueId(key);
     const [fixtures, standings]=await Promise.all([
-      api(key,"/fixtures",{league:leagueId,season}),
+      fetchFixtures(key,leagueId,season),
       api(key,"/standings",{league:leagueId,season}).catch(()=>[])
     ]);
     const data=transform(fixtures, standings, season);
