@@ -5,3 +5,6 @@ node_modules/
 wc26-config.json
 *.log
 .DS_Store
+
+.vercel
+.env*

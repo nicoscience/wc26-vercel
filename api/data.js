@@ -1,14 +1,16 @@
 // Vercel serverless function: GET /api/data
-// Fetches live World Cup 2026 data from KickoffAPI (key from env) and returns the
-// dashboard's WC_DATA shape. The API key stays server-side; the browser only sees JSON.
-//
-// Required env var (set in Vercel → Project → Settings → Environment Variables):
-//   KICKOFF_API_KEY   your KickoffAPI key
-// Optional:
-//   KICKOFF_LEAGUE_ID (defaults to auto-detecting the World Cup finals)
-//   KICKOFF_SEASON    (defaults to 2026)
+// Returns the dashboard's WC_DATA shape from FREE, open, static data sources — no
+// API key, no Cloudflare bot-challenge (KickoffAPI's Cloudflare blocks Vercel's
+// datacenter IPs, so we route around it entirely):
+//   1. openfootball  — https://raw.githubusercontent.com/openfootball/worldcup.json
+//                      full results (scores, penalties) + group tables, updated as
+//                      the tournament progresses. Primary source.
+//   2. TheStatsAPI   — https://www.thestatsapi.com/world-cup/data/fixtures.json
+//                      all 104 fixtures (schedule only, no scores). Fallback.
+// The bracket in index.html stays authoritative; this only supplies scores/results.
 
-const BASE = "https://api.kickoffapi.com/api/v1";
+const OPENFOOTBALL_URL = "https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json";
+const THESTATSAPI_URL  = "https://www.thestatsapi.com/world-cup/data/fixtures.json";
 
 const OWNERS = {
   "Mexico":"Alecia Bland","South Africa":"Jessie Edwards","Switzerland":"Rudolf Arada","Canada":"Ayush Nigam",
@@ -32,117 +34,114 @@ const CANON = new Set(Object.keys(OWNERS));
 const strip = s => (s||"").normalize("NFD").replace(/[̀-ͯ]/g,"").replace(/&/g," and ").replace(/\s+/g," ").toLowerCase().trim();
 function normalizeName(n){ if(!n) return null; const k=strip(n); if(ALIASES[k]) return ALIASES[k];
   for(const c of CANON){ if(strip(c)===k) return c; } return n; }
-function mapStatus(s){ s=(s||"").toUpperCase();
-  if(["NS","TBD","PST"].includes(s)) return "up";
-  if(["1H","2H","ET","BT","LIVE","INT"].includes(s)) return "live";
-  if(s==="HT") return "ht"; if(s==="P"||s==="PEN") return "pens"; if(s==="AET") return "aet";
-  if(["FT","AWD","WO"].includes(s)) return "ft"; return "up"; }
-function stageByDate(iso){ const t=new Date(iso).getTime(); const D=(y,m,d)=>Date.UTC(y,m-1,d);
-  if(isNaN(t)||t<D(2026,6,28)) return "group";
-  if(t<D(2026,7,4)) return "r32"; if(t<D(2026,7,8)) return "r16";
-  if(t<D(2026,7,12)) return "qf"; if(t<D(2026,7,16)) return "sf"; return "final"; }
-const pick=(...v)=>v.find(x=>x!==undefined&&x!==null);
+const owned = c => OWNERS[c] || null;
 
-async function api(key, endpoint, params={}){
-  const url=new URL(BASE+endpoint);
-  Object.entries(params).forEach(([k,v])=> v!=null && url.searchParams.set(k,v));
-  const r=await fetch(url,{headers:{"x-api-key":key,"accept":"application/json"}});
-  if(!r.ok){ const e=new Error(`${r.status} on ${endpoint}`); e.status=r.status; throw e; }
-  const j=await r.json(); return j.response ?? j;
+// Feeder placeholders in unplayed knockout slots (openfootball: "W80"/"L101",
+// TheStatsAPI: "Winner Match 101"/"Group A Winners"). Not real teams — drop them so
+// the bracket's own winner-propagation fills those slots instead.
+const PLACEHOLDER = /^(?:[wl]\d+|(?:winner|loser|runner)\b|group\s|.*\bwinners?\b|.*\brunners?-?up\b)/i;
+function teamName(n){ if(!n) return null; const t=String(n).trim(); if(!t||PLACEHOLDER.test(t)) return null; return normalizeName(t); }
+
+async function getJSON(url){
+  const r=await fetch(url,{headers:{"accept":"application/json"}});
+  if(!r.ok) throw new Error(`${r.status} on ${url}`);
+  return r.json();
 }
 
-// World Cup 2026 runs 2026-06-11 → 2026-07-19.
-const WC_FROM="2026-06-11", WC_TO="2026-07-19";
-// KickoffAPI's 403 ("Endpoint not on your plan") is endpoint-level, not per-param —
-// if league+season 403s, no other query shape helps, so fail fast and let the
-// caller surface it. Only fall back to a date-range pull for *other* failures
-// (e.g. a transient error or an odd empty result on the whole-season shape).
-async function fetchFixtures(key, leagueId, season){
-  try{
-    const f=await api(key,"/fixtures",{league:leagueId,season});
-    if(Array.isArray(f)&&f.length) return f;
-  }catch(e){ if(e.status===403) throw e; }
-  const f=await api(key,"/fixtures",{league:leagueId,season,from:WC_FROM,to:WC_TO});
-  return Array.isArray(f)?f:[];
+// ---- openfootball (primary: results + groups) -----------------------------
+function stageFromRound(round){
+  const r=String(round||"");
+  if(/^matchday/i.test(r))     return "group";
+  if(/round of 32/i.test(r))   return "r32";
+  if(/round of 16/i.test(r))   return "r16";
+  if(/quarter/i.test(r))       return "qf";
+  if(/semi/i.test(r))          return "sf";
+  return "final"; // "Final" and "Match for third place"
 }
-async function resolveLeagueId(key){
-  if(process.env.KICKOFF_LEAGUE_ID) return process.env.KICKOFF_LEAGUE_ID;
-  const leagues=await api(key,"/leagues",{search:"World Cup",type:"Cup"});
-  const named=(leagues||[]).map(l=>({id:l.id||l.league?.id,name:(l.name||l.league?.name||"").trim()}));
-  const finals=n=>/world cup/i.test(n)&&!/qualif|women|u-?\d\d?|futsal|beach|club/i.test(n);
-  const c=named.filter(l=>l.id&&finals(l.name));
-  const pickL=c.find(l=>/^world cup$/i.test(l.name))||c.sort((a,b)=>a.name.length-b.name.length)[0];
-  if(!pickL) throw new Error("Could not resolve World Cup league id; set KICKOFF_LEAGUE_ID.");
-  return pickL.id;
-}
-function transform(fixtures, standings, season){
-  const owned=c=>OWNERS[c]||null;
-  const matches=(fixtures||[]).map(f=>{
-    const home=normalizeName(pick(f?.teams?.home?.name,f?.homeTeam?.name,f?.home?.name));
-    const away=normalizeName(pick(f?.teams?.away?.name,f?.awayTeam?.name,f?.away?.name));
-    const date=pick(f?.fixture?.date,f?.date);
-    let status=mapStatus(pick(f?.fixture?.status?.short,f?.statusShort,f?.status?.short));
-    const hg=pick(f?.goals?.home,f?.goalsHome,f?.homeTeam?.goals,f?.scoreFullHome,null);
-    const ag=pick(f?.goals?.away,f?.goalsAway,f?.awayTeam?.goals,f?.scoreFullAway,null);
-    const penH=pick(f?.score?.penalty?.home,f?.scorePenaltyHome,null);
-    const penA=pick(f?.score?.penalty?.away,f?.scorePenaltyAway,null);
-    if(penH!=null&&penA!=null&&(status==="ft"||status==="aet")) status="pens";
-    const m={ id:"k"+(pick(f?.fixture?.id,f?.id)??Math.random().toString(36).slice(2)),
-      stage:stageByDate(date), date, status, minute:pick(f?.fixture?.status?.elapsed,f?.elapsed,null),
+function fromOpenfootball(doc){
+  const src = Array.isArray(doc?.matches) ? doc.matches : [];
+  const matches = src.map((m,i)=>{
+    const home=teamName(m.team1), away=teamName(m.team2);
+    const sc=m.score||{};
+    const hasFt=Array.isArray(sc.ft);
+    const fin=Array.isArray(sc.et)?sc.et:(hasFt?sc.ft:null); // final score incl. extra time
+    let status="up";
+    if(Array.isArray(sc.p)) status="pens"; else if(Array.isArray(sc.et)) status="aet"; else if(hasFt) status="ft";
+    const o={ id:"of"+(m.num??i), stage:stageFromRound(m.round), date:m.date, status, minute:null,
       home, away, ownerHome:owned(home), ownerAway:owned(away),
-      hg:(hg==null?null:Number(hg)), ag:(ag==null?null:Number(ag)) };
-    if(penH!=null&&penA!=null) m.pens={home:Number(penH),away:Number(penA)};
-    return m;
+      hg:fin?Number(fin[0]):null, ag:fin?Number(fin[1]):null };
+    if(Array.isArray(sc.p)) o.pens={home:Number(sc.p[0]),away:Number(sc.p[1])};
+    return o;
   }).filter(m=>m.home&&m.away);
-  // group tables (best-effort across response shapes)
-  let groups=[];
-  if(Array.isArray(standings)&&standings[0]?.league?.standings){
-    groups=standings[0].league.standings.map((rows,i)=>({ name: rows[0]?.group?.replace(/^Group\s*/i,"")||String.fromCharCode(65+i),
-      teams: rows.map(r=>{ const all=r.all||{},g=all.goals||{}; const country=normalizeName(r.team?.name||r.name);
-        return {country, owner:owned(country), rank:r.rank??null, played:all.played??0, win:all.win??0, draw:all.draw??0, lose:all.lose??0,
-          gf:(g.for??0), ga:(g.against??0), gd:r.goalsDiff??((g.for??0)-(g.against??0)), points:r.points??0}; }) }));
+  return { updatedAt:new Date().toISOString(), source:"openfootball", season:2026,
+    groups:buildGroups(src), matches };
+}
+// openfootball has no standings table — compute it from group-stage results.
+function buildGroups(src){
+  const G={};
+  for(const m of src){
+    if(!/^matchday/i.test(String(m.round||"")) || !m.group) continue;
+    const home=teamName(m.team1), away=teamName(m.team2);
+    if(!home||!away) continue;
+    const g=String(m.group).replace(/^group\s*/i,"").trim();
+    G[g]=G[g]||{};
+    const row=t=> (G[g][t]=G[g][t]||{country:t,played:0,win:0,draw:0,lose:0,gf:0,ga:0,points:0});
+    const H=row(home), A=row(away);
+    const ft=Array.isArray(m.score?.ft)?m.score.ft.map(Number):null;
+    if(!ft) continue; // fixture not played yet
+    const [h,a]=ft;
+    H.played++; A.played++; H.gf+=h; H.ga+=a; A.gf+=a; A.ga+=h;
+    if(h>a){ H.win++; A.lose++; H.points+=3; }
+    else if(h<a){ A.win++; H.lose++; A.points+=3; }
+    else { H.draw++; A.draw++; H.points++; A.points++; }
   }
-  return { updatedAt:new Date().toISOString(), source:"KickoffAPI", season, groups, matches };
+  return Object.keys(G).sort().map(name=>({
+    name,
+    teams: Object.values(G[name])
+      .map(t=>({country:t.country, owner:owned(t.country), played:t.played, win:t.win, draw:t.draw,
+        lose:t.lose, gf:t.gf, ga:t.ga, gd:t.gf-t.ga, points:t.points}))
+      .sort((x,y)=> y.points-x.points || y.gd-x.gd || y.gf-x.gf || x.country.localeCompare(y.country))
+      .map((t,i)=>({...t, rank:i+1}))
+  }));
 }
 
-// Probe KickoffAPI directly and report status/count/shape — no swallowing — so we
-// can see WHY fixtures come back empty. Reachable at /api/data?debug=1
-async function probe(key, endpoint, params){
-  try{ const r=await api(key,endpoint,params);
-    const arr=Array.isArray(r)?r:(r?[r]:[]);
-    return { ok:true, count:arr.length, sampleKeys:arr[0]?Object.keys(arr[0]):[], sample:arr[0]??null };
-  }catch(e){ return { ok:false, status:e.status||null, error:String(e.message||e) }; }
+// ---- TheStatsAPI (fallback: schedule only, no scores) ---------------------
+function stageFromTS(s){
+  s=String(s||"").toLowerCase();
+  if(s.includes("32")) return "r32"; if(s.includes("16")) return "r16";
+  if(s.includes("quarter")) return "qf"; if(s.includes("semi")) return "sf";
+  if(s.includes("third")||s.includes("final")) return "final";
+  return "group";
 }
-async function debugReport(key, season){
-  const out={ season, env:{ leagueIdSet:!!process.env.KICKOFF_LEAGUE_ID, seasonSet:!!process.env.KICKOFF_SEASON } };
-  out.leaguesSearch=await probe(key,"/leagues",{search:"World Cup",type:"Cup"});
-  let leagueId=null;
-  try{ leagueId=await resolveLeagueId(key); out.resolvedLeagueId=leagueId; }
-  catch(e){ out.resolvedLeagueId=null; out.resolveError=String(e.message||e); }
-  if(leagueId){
-    out.byLeagueSeason  =await probe(key,"/fixtures",{league:leagueId,season});
-    out.byDateRange     =await probe(key,"/fixtures",{league:leagueId,season,from:WC_FROM,to:WC_TO});
-    out.bySingleDate    =await probe(key,"/fixtures",{league:leagueId,season,date:"2026-07-01"});
-    out.byLeagueNoSeason=await probe(key,"/fixtures",{league:leagueId});
-    out.standings       =await probe(key,"/standings",{league:leagueId,season});
-  }
-  return out;
+function fromTheStatsAPI(doc){
+  const fx=Array.isArray(doc?.fixtures)?doc.fixtures:[];
+  const matches=fx.map((m,i)=>{
+    const home=teamName(m.homeTeam), away=teamName(m.awayTeam);
+    return { id:"ts"+(m.matchNumber??i), stage:stageFromTS(m.stage), date:m.kickoffUtc||m.date,
+      status:"up", minute:null, home, away, ownerHome:owned(home), ownerAway:owned(away), hg:null, ag:null };
+  }).filter(m=>m.home&&m.away);
+  return { updatedAt:new Date().toISOString(), source:"TheStatsAPI (fixtures, no scores)", season:2026,
+    groups:[], matches };
 }
 
 export default async function handler(req, res){
   try{
-    const key=process.env.KICKOFF_API_KEY;
-    if(!key){ res.status(500).json({error:"KICKOFF_API_KEY not set"}); return; }
-    const season=Number(process.env.KICKOFF_SEASON||2026);
-    if(req.query?.debug){ res.status(200).json(await debugReport(key,season)); return; }
-    const leagueId=await resolveLeagueId(key);
-    const [fixtures, standings]=await Promise.all([
-      fetchFixtures(key,leagueId,season),
-      api(key,"/standings",{league:leagueId,season}).catch(()=>[])
-    ]);
-    const data=transform(fixtures, standings, season);
-    // cache at the edge so we don't hammer KickoffAPI when many people open the page
-    res.setHeader("Cache-Control","s-maxage=60, stale-while-revalidate=120");
+    let data, errors=[];
+    try{ data=fromOpenfootball(await getJSON(OPENFOOTBALL_URL)); }
+    catch(e){ errors.push("openfootball: "+String(e.message||e));
+      try{ data=fromTheStatsAPI(await getJSON(THESTATSAPI_URL)); }
+      catch(e2){ errors.push("thestatsapi: "+String(e2.message||e2)); } }
+    if(!data || !data.matches.length){
+      res.status(502).json({error:"no data from sources", details:errors}); return;
+    }
+    if(req.query?.debug){
+      res.status(200).json({ source:data.source, matches:data.matches.length,
+        played:data.matches.filter(m=>m.hg!=null).length, groups:data.groups.length,
+        owned:data.matches.filter(m=>m.ownerHome||m.ownerAway).length, errors, sample:data.matches[0] });
+      return;
+    }
+    // openfootball/TheStatsAPI update infrequently; cache a few minutes at the edge.
+    res.setHeader("Cache-Control","s-maxage=300, stale-while-revalidate=600");
     res.status(200).json(data);
   }catch(e){ res.status(502).json({error:String(e.message||e)}); }
 }
