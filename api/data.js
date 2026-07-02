@@ -116,11 +116,36 @@ function transform(fixtures, standings, season){
   return { updatedAt:new Date().toISOString(), source:"KickoffAPI", season, groups, matches };
 }
 
+// Probe KickoffAPI directly and report status/count/shape — no swallowing — so we
+// can see WHY fixtures come back empty. Reachable at /api/data?debug=1
+async function probe(key, endpoint, params){
+  try{ const r=await api(key,endpoint,params);
+    const arr=Array.isArray(r)?r:(r?[r]:[]);
+    return { ok:true, count:arr.length, sampleKeys:arr[0]?Object.keys(arr[0]):[], sample:arr[0]??null };
+  }catch(e){ return { ok:false, status:e.status||null, error:String(e.message||e) }; }
+}
+async function debugReport(key, season){
+  const out={ season, env:{ leagueIdSet:!!process.env.KICKOFF_LEAGUE_ID, seasonSet:!!process.env.KICKOFF_SEASON } };
+  out.leaguesSearch=await probe(key,"/leagues",{search:"World Cup",type:"Cup"});
+  let leagueId=null;
+  try{ leagueId=await resolveLeagueId(key); out.resolvedLeagueId=leagueId; }
+  catch(e){ out.resolvedLeagueId=null; out.resolveError=String(e.message||e); }
+  if(leagueId){
+    out.byLeagueSeason  =await probe(key,"/fixtures",{league:leagueId,season});
+    out.byDateRange     =await probe(key,"/fixtures",{league:leagueId,season,from:WC_FROM,to:WC_TO});
+    out.bySingleDate    =await probe(key,"/fixtures",{league:leagueId,season,date:"2026-07-01"});
+    out.byLeagueNoSeason=await probe(key,"/fixtures",{league:leagueId});
+    out.standings       =await probe(key,"/standings",{league:leagueId,season});
+  }
+  return out;
+}
+
 export default async function handler(req, res){
   try{
     const key=process.env.KICKOFF_API_KEY;
     if(!key){ res.status(500).json({error:"KICKOFF_API_KEY not set"}); return; }
     const season=Number(process.env.KICKOFF_SEASON||2026);
+    if(req.query?.debug){ res.status(200).json(await debugReport(key,season)); return; }
     const leagueId=await resolveLeagueId(key);
     const [fixtures, standings]=await Promise.all([
       fetchFixtures(key,leagueId,season),
