@@ -51,30 +51,19 @@ async function api(key, endpoint, params={}){
   const j=await r.json(); return j.response ?? j;
 }
 
-// World Cup 2026 runs 2026-06-11 → 2026-07-19. The free ("Hobby") KickoffAPI plan
-// gates live=all and, in practice, the bulk league+season fixtures query (403 =
-// "Endpoint not on your plan"). So try the cheap query first, then fall back to
-// date-scoped queries that the free tier does allow.
+// World Cup 2026 runs 2026-06-11 → 2026-07-19.
 const WC_FROM="2026-06-11", WC_TO="2026-07-19";
-function eachDate(fromISO, toISO){
-  const out=[]; const d=new Date(fromISO+"T00:00:00Z"); const end=new Date(toISO+"T00:00:00Z");
-  for(; d<=end; d.setUTCDate(d.getUTCDate()+1)) out.push(d.toISOString().slice(0,10));
-  return out;
-}
+// KickoffAPI's 403 ("Endpoint not on your plan") is endpoint-level, not per-param —
+// if league+season 403s, no other query shape helps, so fail fast and let the
+// caller surface it. Only fall back to a date-range pull for *other* failures
+// (e.g. a transient error or an odd empty result on the whole-season shape).
 async function fetchFixtures(key, leagueId, season){
-  // 1) whole-season pull (works on paid plans; may 403 on free)
-  try{ const f=await api(key,"/fixtures",{league:leagueId,season}); if(Array.isArray(f)&&f.length) return f; }
-  catch(e){ if(e.status&&e.status!==403) throw e; }
-  // 2) single date-range pull over the tournament window
-  try{ const f=await api(key,"/fixtures",{league:leagueId,season,from:WC_FROM,to:WC_TO});
-    if(Array.isArray(f)&&f.length) return f; }
-  catch(e){ if(e.status&&e.status!==403) throw e; }
-  // 3) last resort: one request per date (free-tier safe; bounded by the 39-day window)
-  const days=eachDate(WC_FROM,WC_TO);
-  const perDay=await Promise.all(days.map(date=>
-    api(key,"/fixtures",{league:leagueId,season,date}).catch(()=>[])
-  ));
-  return perDay.flat().filter(Boolean);
+  try{
+    const f=await api(key,"/fixtures",{league:leagueId,season});
+    if(Array.isArray(f)&&f.length) return f;
+  }catch(e){ if(e.status===403) throw e; }
+  const f=await api(key,"/fixtures",{league:leagueId,season,from:WC_FROM,to:WC_TO});
+  return Array.isArray(f)?f:[];
 }
 async function resolveLeagueId(key){
   if(process.env.KICKOFF_LEAGUE_ID) return process.env.KICKOFF_LEAGUE_ID;
