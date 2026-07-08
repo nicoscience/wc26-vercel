@@ -4,5 +4,10 @@
   "private": true,
   "description": "AoFrio World Cup 2026 office sweepstakes bracket dashboard",
   "type": "module",
-  "engines": { "node": ">=18" }
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@vercel/analytics": "^2.0.1"
+  }
 }
